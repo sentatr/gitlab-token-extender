@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 GitLab Access Token Extender
-Manages and extends GitLab access tokens with comprehensive logging and error handling.
+Manages and extends GitLab project access tokens for specified groups with comprehensive logging.
 """
 import os
 import sys
@@ -26,6 +26,7 @@ class Config:
     """Configuration settings for GitLab token extender"""
     access_token: str
     api_url: str
+    group_names: List[str]
     log_file: Path = Path("./extender.log")
     temp_file: Path = Path("/tmp/gitlab_token_commands.rb")
     expiry_days: int = 30
@@ -38,6 +39,8 @@ class Config:
             raise ValueError("GITLAB_ACCESS_TOKEN is required")
         if not self.api_url:
             raise ValueError("GITLAB_API_URL is required")
+        if not self.group_names:
+            raise ValueError("At least one group name must be specified")
         if not self.log_file.parent.exists():
             raise ValueError(f"Log file directory {self.log_file.parent} does not exist")
 
@@ -175,7 +178,7 @@ def execute_rails_commands(commands: List[str], config: Config, correlation_id: 
                                   "command_count": len(commands),
                                   "duration": duration,
                                   "return_code": result.returncode,
-                                  "stdout": result.stdout[:1000]  # Limit log size
+                                  "stdout": result.stdout[:1000]
                               }})
         return True
     except subprocess.CalledProcessError as e:
@@ -191,10 +194,10 @@ def execute_rails_commands(commands: List[str], config: Config, correlation_id: 
 
 @timeit
 def process_tokens(client: gitlab.Gitlab, check_expiry: bool, config: Config, correlation_id: str) -> List[str]:
-    """Process all types of tokens and generate extension commands"""
+    """Process project access tokens for specified groups"""
     commands = []
     expiry_date = (datetime.datetime.now() + datetime.timedelta(days=config.expiry_days)).strftime('%Y-%m-%d')
-    processed_counts = {"personal": 0, "group": 0, "project": 0}
+    processed_counts = {"project": 0}
 
     def process_single_token(token, token_type: str) -> Optional[str]:
         token_correlation_id = str(uuid.uuid4())
@@ -204,14 +207,6 @@ def process_tokens(client: gitlab.Gitlab, check_expiry: bool, config: Config, co
                             extra={"correlation_id": token_correlation_id,
                                   "context": {"token_id": token.id, "token_type": token_type}})
                 return None
-
-            if token_type == "personal":
-                user = client.users.get(token.user_id)
-                if user.state != "active":
-                    logging.debug(f"Skipping token for inactive user",
-                                 extra={"correlation_id": token_correlation_id,
-                                       "context": {"token_id": token.id, "user_id": token.user_id}})
-                    return None
 
             expires_soon = token.expires_at and token.expires_at <= expiry_date
             if check_expiry and not expires_soon:
@@ -232,40 +227,38 @@ def process_tokens(client: gitlab.Gitlab, check_expiry: bool, config: Config, co
                                "context": {"token_id": token.id, "token_type": token_type, "error": str(e)}})
             return None
 
-    # Process personal tokens
+    # Process project tokens for specified groups
     start_time = perf_counter()
-    personal_tokens = client.personal_access_tokens.list(all=True, iterator=True)
-    commands.extend([cmd for cmd in map(lambda t: process_single_token(t, "personal"), personal_tokens) if cmd])
-    logging.info(f"Processed personal tokens",
-                extra={"correlation_id": correlation_id,
-                      "context": {"token_count": processed_counts["personal"],
-                                 "duration": perf_counter() - start_time}})
-
-    # Process group tokens
-    start_time = perf_counter()
-    for group in client.groups.list(all=True, iterator=True):
+    for group_name in config.group_names:
         try:
-            tokens = group.access_tokens.list(all=True, iterator=True)
-            commands.extend([cmd for cmd in map(lambda t: process_single_token(t, "group"), tokens) if cmd])
-        except gitlab.exceptions.GitlabError as e:
-            logging.error(f"Error accessing tokens for group: {str(e)}",
-                         extra={"correlation_id": correlation_id,
-                               "context": {"group_id": group.id, "group_name": group.name, "error": str(e)}})
-    logging.info(f"Processed group tokens",
-                extra={"correlation_id": correlation_id,
-                      "context": {"token_count": processed_counts["group"],
-                                 "duration": perf_counter() - start_time}})
+            groups = client.groups.list(search=group_name, all=True)
+            if not groups:
+                logging.warning(f"No group found with name: {group_name}",
+                               extra={"correlation_id": correlation_id,
+                                     "context": {"group_name": group_name}})
+                continue
 
-    # Process project tokens
-    start_time = perf_counter()
-    for project in client.projects.list(all=True, iterator=True):
-        try:
-            tokens = project.access_tokens.list(all=True, iterator=True)
-            commands.extend([cmd for cmd in map(lambda t: process_single_token(t, "project"), tokens) if cmd])
+            for group in groups:
+                try:
+                    projects = group.projects.list(all=True, iterator=True)
+                    for project in projects:
+                        try:
+                            project_obj = client.projects.get(project.id)
+                            tokens = project_obj.access_tokens.list(all=True, iterator=True)
+                            commands.extend([cmd for cmd in map(lambda t: process_single_token(t, "project"), tokens) if cmd])
+                        except gitlab.exceptions.GitlabError as e:
+                            logging.error(f"Error accessing tokens for project: {str(e)}",
+                                         extra={"correlation_id": correlation_id,
+                                               "context": {"project_id": project.id, "project_name": project.name, "error": str(e)}})
+                except gitlab.exceptions.GitlabError as e:
+                    logging.error(f"Error accessing projects for group: {str(e)}",
+                                 extra={"correlation_id": correlation_id,
+                                       "context": {"group_id": group.id, "group_name": group.name, "error": str(e)}})
         except gitlab.exceptions.GitlabError as e:
-            logging.error(f"Error accessing tokens for project: {str(e)}",
+            logging.error(f"Error searching for group {group_name}: {str(e)}",
                          extra={"correlation_id": correlation_id,
-                               "context": {"project_id": project.id, "project_name": project.name, "error": str(e)}})
+                               "context": {"group_name": group_name, "error": str(e)}})
+
     logging.info(f"Processed project tokens",
                 extra={"correlation_id": correlation_id,
                       "context": {"token_count": processed_counts["project"],
@@ -273,7 +266,7 @@ def process_tokens(client: gitlab.Gitlab, check_expiry: bool, config: Config, co
 
     logging.info("Completed token processing",
                 extra={"correlation_id": correlation_id,
-                      "context": {"total_tokens": sum(processed_counts.values()),
+                      "context": {"total_tokens": processed_counts["project"],
                                  "breakdown": processed_counts}})
     return commands
 
@@ -284,9 +277,14 @@ def main():
 
     # Load and validate configuration
     load_dotenv()
+    group_names = sys.argv[1:] if len(sys.argv) > 1 else []
+    if "--check-expiry" in group_names:
+        group_names.remove("--check-expiry")
+    
     config = Config(
         access_token=os.getenv("GITLAB_ACCESS_TOKEN", ""),
-        api_url=os.getenv("GITLAB_API_URL", "")
+        api_url=os.getenv("GITLAB_API_URL", ""),
+        group_names=group_names
     )
     
     try:
@@ -301,10 +299,11 @@ def main():
     setup_logging(config.log_file)
     logging.info("Starting token extension process",
                 extra={"correlation_id": correlation_id,
-                      "context": {"start_time": datetime.datetime.now().isoformat()}})
+                      "context": {"start_time": datetime.datetime.now().isoformat(),
+                                 "group_names": group_names}})
 
     # Check command line arguments
-    check_expiry = len(sys.argv) > 1 and sys.argv[1] == "--check-expiry"
+    check_expiry = "--check-expiry" in sys.argv
     logging.info(f"Running with check_expiry: {check_expiry}",
                 extra={"correlation_id": correlation_id,
                       "context": {"check_expiry": check_expiry}})
